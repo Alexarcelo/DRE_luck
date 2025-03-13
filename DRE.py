@@ -1608,13 +1608,11 @@ filtrar_ano, filtrar_mes, tipo_analise = colher_filtros(
 
 # Filtrando colunas que vou usar, ajustando formato de Mes_Ano e filtrando anos e meses escolhidos pelo usuário
 
-if not 'df_grafico_vendas_gerais' in st.session_state:
-
-    st.session_state.df_grafico_vendas_gerais = gerar_df_grafico_vendas_gerais(
-        filtrar_ano, 
-        filtrar_mes, 
-        st.session_state.df_dre_mensal
-    )
+st.session_state.df_grafico_vendas_gerais = gerar_df_grafico_vendas_gerais(
+    filtrar_ano, 
+    filtrar_mes, 
+    st.session_state.df_dre_mensal
+)
 
 if tipo_analise=='Análise de Receitas':
 
