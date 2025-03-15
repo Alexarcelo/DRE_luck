@@ -9,6 +9,9 @@ import plotly.graph_objects as go
 import mysql.connector
 import decimal
 import datetime
+from google.cloud import secretmanager
+import json
+from google.cloud import bigquery
 
 def puxar_aba_simples(id_gsheet, nome_aba, nome_df):
 
@@ -83,6 +86,10 @@ def puxar_dados_gsheet(id_gsheet, nome_aba, nome_df, colunas_numero=None, coluna
             st.session_state[nome_df].columns
         )
 
+    elif colunas_numero == 'Nenhuma':
+
+        pass
+
     else:
 
         tratar_colunas_numero_df(
@@ -97,7 +104,11 @@ def puxar_dados_gsheet(id_gsheet, nome_aba, nome_df, colunas_numero=None, coluna
             colunas_data
         )
 
-    if not coluna_data_ano_mes is None:
+    if coluna_data_ano_mes == 'Nenhuma':
+
+        pass
+
+    elif not coluna_data_ano_mes is None:
 
         st.session_state[nome_df] = adicionar_colunas_ano_mes(
             st.session_state[nome_df], 
@@ -177,7 +188,56 @@ def puxar_df_campanha(id_gsheet, noma_aba_1, nome_df_1, colunas_numero_df_1, col
     st.session_state[nome_df_1] = adicionar_colunas_ano_mes(
         st.session_state[nome_df_1], 
         coluna_data_ano_mes
+    )   
+
+def gerar_df_big_query_tratado():
+
+    def puxar_df_big_query():
+
+        project_id = "base-omie-analise"
+
+        secret_id = "Cred"
+
+        secret_client = secretmanager.SecretManagerServiceClient()
+
+        secret_name = f"projects/{project_id}/secrets/{secret_id}/versions/latest"
+
+        response = secret_client.access_secret_version(request={"name": secret_name})
+
+        secret_payload = response.payload.data.decode("UTF-8")
+
+        credentials_info = json.loads(secret_payload)
+
+        autenticar = service_account.Credentials.from_service_account_info(credentials_info)
+
+        config_cliente = bigquery.Client(credentials=autenticar, project=autenticar.project_id)
+
+        consulta_geral = f"""
+        SELECT * 
+        FROM `base-omie-analise.BD_Luck.Base_Omie` 
+        """
+        df = config_cliente.query(consulta_geral).to_dataframe()
+        
+        return df
+
+    st.session_state.df_big_query = puxar_df_big_query()
+
+    st.session_state.df_big_query = st.session_state.df_big_query[st.session_state.df_big_query['BD']!='Base_Kuara'].reset_index(drop=True)
+
+    st.session_state.df_big_query = st.session_state.df_big_query[~st.session_state.df_big_query['Desc_Depto'].isin(['Mansear', 'Kuara'])].reset_index(drop=True)
+
+def gerar_dict_categorias_alteradas():
+
+    puxar_dados_gsheet(
+        id_gsheet=st.session_state.id_gsheet_bd_omie_luck, 
+        nome_aba='BD_Categorias_Alteradas', 
+        nome_df='df_categorias_alteradas',
+        colunas_numero='Nenhuma',
+        colunas_data=None,
+        coluna_data_ano_mes='Nenhuma'
     )
+
+    st.session_state.dict_categorias_alteradas = dict(zip(st.session_state.df_categorias_alteradas['Categoria Anterior'], st.session_state.df_categorias_alteradas['Categoria Atual']))
 
 def gerar_df_vendas_final():
 
@@ -314,9 +374,48 @@ def gerar_df_vendas_final():
 
 def gerar_df_dre_mensal():
 
-    def inserir_colunas_tipos_despesas(df_margens):
+    def gerar_df_dre_atualizado(df_dre_mensal):
 
-        df_insercao = st.session_state.df_dre.groupby(['Mes_Ano', 'Tipo'], as_index=False)['Valor_Depto'].sum()
+        df_omie = st.session_state.df_big_query[['Data_venc', 'Desc_Depto', 'Valor_Depto', 'Descricao']].copy()
+
+        df_omie.rename(columns = {'Descricao': 'Categoria'}, inplace=True)
+
+        df_omie['Data_venc'] = pd.to_datetime(df_omie['Data_venc']).dt.date
+
+        df_omie = adicionar_colunas_ano_mes(df_omie, 'Data_venc')
+
+        df_base = st.session_state.df_dre.copy()
+
+        df_base = pd.concat([df_base, df_omie], ignore_index=True)
+
+        df_base['Desc_Depto'] = df_base['Desc_Depto'].str.upper()
+
+        df_base = df_base[df_base['Valor_Depto'] != 0].reset_index(drop=True)
+
+        df_base['Categoria'] = df_base['Categoria'].replace(st.session_state.dict_categorias_alteradas)
+
+        df_base = df_base[~df_base['Categoria'].isin(st.session_state.df_remover_categorias['Categoria'])].reset_index(drop=True)
+
+        df_categ = st.session_state.df_categoria_omie.drop_duplicates(subset=['Categoria_OMIE'])
+
+        df_merged = df_base.merge(
+            df_categ[['Categoria_OMIE', 'Tipo']], 
+            left_on='Categoria', 
+            right_on='Categoria_OMIE', 
+            how='left',
+        )
+
+        df_merged.drop(columns=['Tipo_x'], inplace=True)
+
+        df_merged.rename(columns={'Tipo_y': 'Tipo'}, inplace=True)
+
+        df_merged = df_merged[df_merged['Mes_Ano']<=df_dre_mensal['Mes_Ano'].max()].reset_index(drop=True)
+
+        return df_merged
+
+    def inserir_colunas_tipos_despesas(df_margens, df_dre_atualizado):
+
+        df_insercao = df_dre_atualizado.groupby(['Mes_Ano', 'Tipo'], as_index=False)['Valor_Depto'].sum()
 
         for tipo in df_insercao['Tipo'].unique():
 
@@ -326,7 +425,7 @@ def gerar_df_dre_mensal():
 
             df_margens[f'{tipo}'] = df_margens[f'{tipo}'].fillna(0)
 
-        df_insercao_2 = st.session_state.df_dre[st.session_state.df_dre['Categoria'].isin(st.session_state.lista_despesas_mc_marcelo)].groupby(['Mes_Ano'], as_index=False)['Valor_Depto'].sum()
+        df_insercao_2 = df_dre_atualizado[df_dre_atualizado['Categoria'].isin(st.session_state.lista_despesas_mc_marcelo)].groupby(['Mes_Ano'], as_index=False)['Valor_Depto'].sum()
 
         df_margens = df_margens.merge(df_insercao_2, on='Mes_Ano', how='left')
 
@@ -335,10 +434,14 @@ def gerar_df_dre_mensal():
         df_margens['Despesas MC Marcelo'] = df_margens['Despesas MC Marcelo'].fillna(0)
 
         return df_margens
-
+    
     df_dre_mensal = st.session_state.df_receitas[['Ano', 'Mes', 'Mes_Ano']].drop_duplicates().sort_values(by=['Ano', 'Mes']).reset_index(drop=True)
 
-    df_dre_mensal = inserir_colunas_tipos_despesas(df_dre_mensal)
+    df_dre_atualizado = gerar_df_dre_atualizado(df_dre_mensal)
+
+    st.session_state.df_dre_atualizado = df_dre_atualizado
+
+    df_dre_mensal = inserir_colunas_tipos_despesas(df_dre_mensal, df_dre_atualizado)
 
     df_dre_mensal = df_dre_mensal.merge(st.session_state.df_receitas.drop(columns=['Ano', 'Mes']), on='Mes_Ano', how='left')
 
@@ -945,7 +1048,7 @@ def plotar_graficos_resultado_bruto(row3, df_grafico_vendas_gerais):
 
 def gerar_df_dre_filtrado(filtrar_ano, filtrar_mes):
 
-    df_dre_filtrado = st.session_state.df_dre.copy()
+    df_dre_filtrado = st.session_state.df_dre_atualizado.copy()
 
     if len(filtrar_ano)>0:
 
@@ -1531,340 +1634,386 @@ if not 'id_gsheet_bd_omie_luck' in st.session_state:
 
         st.session_state.id_gsheet_campanha_motoristas = '1Sx6CYMIuFzpeTur5WibxofQfiTk6hyohA3huDCHhKDg'
 
-        st.session_state.lista_despesas_mc_marcelo = ['Autonomo', 'Locação de Veículos', 'Manutenção Frota', 'Pneus', 'Diesel Interno', 'Diesel Externo', 'Gasolina']
+        st.session_state.lista_despesas_mc_marcelo = [
+            'Autonomo', 
+            'Locação de Veículos', 
+            'Manutenção Frota', 
+            'Pneus', 
+            'Diesel Interno', 
+            'Diesel Externo', 
+            'Gasolina'
+        ]
+
+        st.session_state.lista_empresas = [
+            'Luck', 
+            'Mansear', 
+            'Kuara'
+        ]
 
 st.title('DRE')
 
 st.divider()
 
-# Puxando dados do Drive e do Phoenix
-
-if st.session_state.base_luck == 'test_phoenix_joao_pessoa':
-
-    if not 'df_vendas_final' in st.session_state:
-
-        with st.spinner('Carregando dados do Google Drive...'):
-
-            puxar_dados_gsheet(
-                id_gsheet=st.session_state.id_gsheet_bd_omie_luck, 
-                nome_aba='BD_Luck', 
-                nome_df='df_dre', 
-                colunas_numero=['Valor_Depto'], 
-                colunas_data=['Data_venc'], 
-                coluna_data_ano_mes='Data_venc'
-            )
-            
-            puxar_dados_gsheet(
-                id_gsheet=st.session_state.id_gsheet_bd_omie_luck, 
-                nome_aba='BD_Historico_Marcelo', 
-                nome_df='df_receitas'
-            )
-            
-            puxar_dados_gsheet(
-                id_gsheet=st.session_state.id_gsheet_bi_vendas, 
-                nome_aba='BD - Metas', 
-                nome_df='df_metas'
-            )
-
-            puxar_df_historico(
-                st.session_state.id_gsheet_bi_vendas, 
-                'BD - Historico', 
-                'df_historico'
-            )
-
-            puxar_df_campanha(
-                st.session_state.id_gsheet_campanha_motoristas, 
-                'BD - Historico', 
-                'df_abastecimentos', 
-                ['Média', 'Meta', 'Mes', 'Ano', 'Meta do período'], 
-                ['Data de Abastecimento'], 
-                'BD - Frota | Tipo', 'df_frota', 'Data de Abastecimento'
-            )
-
-        with st.spinner('Carregando dados do Phoenix...'):
-
-            st.session_state.df_vendas_final = gerar_df_vendas_final()
-
-# Gerando dataframes com dados da DRE, Vendas e Campanha
-
-if not 'df_dre_mensal' in st.session_state or not 'df_vendas_agrupado' in st.session_state or not 'df_campanha_mensal' in st.session_state:
-
-    st.session_state.df_dre_mensal = gerar_df_dre_mensal()
-    
-    st.session_state.df_vendas_agrupado = gerar_df_vendas_agrupado()
-
-    gerar_df_campanha_mensal()
-
-st.header('Filtros')
-
-row1 = st.columns(4)
-
-# Colhendo filtros escolhidos pelo usuário
-
-filtrar_ano, filtrar_mes, tipo_analise = colher_filtros(
-    row1, 
-    st.session_state.df_dre_mensal
+empresa_selecionada = st.radio(
+    'Selecione a empresa', 
+    st.session_state.lista_empresas,
+    index=None
 )
 
-# Filtrando colunas que vou usar, ajustando formato de Mes_Ano e filtrando anos e meses escolhidos pelo usuário
+if empresa_selecionada == 'Luck':
 
-st.session_state.df_grafico_vendas_gerais = gerar_df_grafico_vendas_gerais(
-    filtrar_ano, 
-    filtrar_mes, 
-    st.session_state.df_dre_mensal
-)
+    # Puxando dados do Drive e do Phoenix
 
-if tipo_analise=='Análise de Receitas':
+    if st.session_state.base_luck == 'test_phoenix_joao_pessoa':
 
-    st.divider()
+        if not 'df_vendas_final' in st.session_state:
 
-    st.header('Análise de Receitas')
+            with st.spinner('Carregando dados do Google Drive...'):
 
-    st.subheader('Vendas - Opcionais e Faturamento')
+                puxar_dados_gsheet(
+                    id_gsheet=st.session_state.id_gsheet_bd_omie_luck, 
+                    nome_aba='BD_Luck', 
+                    nome_df='df_dre', 
+                    colunas_numero=['Valor_Depto'], 
+                    colunas_data=['Data_venc'], 
+                    coluna_data_ano_mes='Data_venc'
+                )
+                
+                puxar_dados_gsheet(
+                    id_gsheet=st.session_state.id_gsheet_bd_omie_luck, 
+                    nome_aba='BD_Historico_Marcelo', 
+                    nome_df='df_receitas'
+                )
+                
+                puxar_dados_gsheet(
+                    id_gsheet=st.session_state.id_gsheet_bi_vendas, 
+                    nome_aba='BD - Metas', 
+                    nome_df='df_metas'
+                )
 
-    row2 = st.columns(2)
+                puxar_df_historico(
+                    st.session_state.id_gsheet_bi_vendas, 
+                    'BD - Historico', 
+                    'df_historico'
+                )
 
-    st.subheader('Vendas por Setor')
+                puxar_df_campanha(
+                    st.session_state.id_gsheet_campanha_motoristas, 
+                    'BD - Historico', 
+                    'df_abastecimentos', 
+                    ['Média', 'Meta', 'Mes', 'Ano', 'Meta do período'], 
+                    ['Data de Abastecimento'], 
+                    'BD - Frota | Tipo', 'df_frota', 'Data de Abastecimento'
+                )
 
-    row3 = st.columns(2)
+                puxar_aba_simples(
+                    st.session_state.id_gsheet_bd_omie_luck, 
+                    'BD_Categoria_De_Para', 
+                    'df_categoria_omie'
+                )
 
-    plotar_graficos_analise_de_receitas(
+                gerar_df_big_query_tratado()
+
+                gerar_dict_categorias_alteradas()
+
+                puxar_dados_gsheet(
+                    id_gsheet=st.session_state.id_gsheet_bd_omie_luck, 
+                    nome_aba='BD_Remover_Categorias', 
+                    nome_df='df_remover_categorias',
+                    colunas_numero='Nenhuma',
+                    colunas_data=None,
+                    coluna_data_ano_mes='Nenhuma'
+                )
+
+            with st.spinner('Carregando dados do Phoenix...'):
+
+                st.session_state.df_vendas_final = gerar_df_vendas_final()
+
+    # Gerando dataframes com dados da DRE, Vendas e Campanha
+
+    if not 'df_dre_mensal' in st.session_state \
+        or not 'df_vendas_agrupado' in st.session_state \
+            or not 'df_campanha_mensal' in st.session_state:
+
+        st.session_state.df_dre_mensal = gerar_df_dre_mensal()
+        
+        st.session_state.df_vendas_agrupado = gerar_df_vendas_agrupado()
+
+        gerar_df_campanha_mensal()
+
+    st.header('Filtros')
+
+    row1 = st.columns(4)
+
+    # Colhendo filtros escolhidos pelo usuário
+
+    filtrar_ano, filtrar_mes, tipo_analise = colher_filtros(
+        row1, 
+        st.session_state.df_dre_mensal
+    )
+
+    # Filtrando colunas que vou usar, ajustando formato de Mes_Ano e filtrando anos e meses escolhidos pelo usuário
+
+    st.session_state.df_grafico_vendas_gerais = gerar_df_grafico_vendas_gerais(
         filtrar_ano, 
         filtrar_mes, 
-        st.session_state.df_grafico_vendas_gerais, 
-        row2, 
-        row3
+        st.session_state.df_dre_mensal
     )
 
-elif tipo_analise=='Análise de Margens':
+    if tipo_analise=='Análise de Receitas':
 
-    st.divider()
+        st.divider()
 
-    st.header('Análise de Margens') 
+        st.header('Análise de Receitas')
 
-    st.subheader('Margens - Bruta, Operacional e Líquida')
+        st.subheader('Vendas - Opcionais e Faturamento')
 
-    row2 = st.columns(1)
+        row2 = st.columns(2)
 
-    st.divider()
+        st.subheader('Vendas por Setor')
 
-    st.subheader('Margem Bruta')
+        row3 = st.columns(2)
 
-    row3 = st.columns(2)
-
-    row4 = st.columns(2)
-
-    # Plotagem de gráficos de resumo de margens, resultado bruto vs margem bruta, CPV vs CPV / Paxs e % Despesas / CPV
-
-    plotar_grafico_resumo_margens(
-        row2, 
-        st.session_state.df_grafico_vendas_gerais
-    )
-
-    plotar_graficos_resultado_bruto(
-        row3, 
-        st.session_state.df_grafico_vendas_gerais
-    )
-
-    # Gerando df_dre_filtrado e df_cpv_filtrado
-
-    if not 'df_dre_filtrado' in st.session_state or not 'df_cpv_filtrado' in st.session_state or not 'df_do_filtrado' in st.session_state or not 'df_df_filtrado' in st.session_state:
-
-        # Criando dataframe apenas com Anos e Meses selecionados pelo usuário
-
-        st.session_state.df_dre_filtrado = gerar_df_dre_filtrado(
+        plotar_graficos_analise_de_receitas(
             filtrar_ano, 
-            filtrar_mes
+            filtrar_mes, 
+            st.session_state.df_grafico_vendas_gerais, 
+            row2, 
+            row3
         )
 
-        # Gerando dataframe somente com categorias de CPV em colunas
+    elif tipo_analise=='Análise de Margens':
 
-        df_cpv_filtrado = gerar_df_categorias(
-            st.session_state.df_dre_filtrado, 
-            'CPV'
+        st.divider()
+
+        st.header('Análise de Margens') 
+
+        st.subheader('Margens - Bruta, Operacional e Líquida')
+
+        row2 = st.columns(1)
+
+        st.divider()
+
+        st.subheader('Margem Bruta')
+
+        row3 = st.columns(2)
+
+        row4 = st.columns(2)
+
+        # Plotagem de gráficos de resumo de margens, resultado bruto vs margem bruta, CPV vs CPV / Paxs e % Despesas / CPV
+
+        plotar_grafico_resumo_margens(
+            row2, 
+            st.session_state.df_grafico_vendas_gerais
         )
 
-        # Inserir Comissão Geral, Diesel Total e % de ['Autonomo', 'Locação de Veículos', 'Manutenção Frota', 'Pneus', 'Diesel Total'] em relação ao CPV
-
-        st.session_state.df_cpv_filtrado = inserir_kpis_especificos_cpv(df_cpv_filtrado)
-
-        # Gerando dataframe somente com categorias de Despesas Operacionais em colunas
-
-        df_do_filtrado = gerar_df_categorias(
-            st.session_state.df_dre_filtrado, 
-            'Despesas Operacionais'
+        plotar_graficos_resultado_bruto(
+            row3, 
+            st.session_state.df_grafico_vendas_gerais
         )
 
-        st.session_state.df_do_filtrado = inserir_kpis_especificos_do(df_do_filtrado)
+        # Gerando df_dre_filtrado e df_cpv_filtrado
 
-        st.session_state.df_df_filtrado = gerar_df_categorias(
-            st.session_state.df_dre_filtrado, 
-            'Despesas Financeiras'
-        )
+        if not 'df_dre_filtrado' in st.session_state \
+            or not 'df_cpv_filtrado' in st.session_state \
+                or not 'df_do_filtrado' in st.session_state \
+                    or not 'df_df_filtrado' in st.session_state:
 
-    # Plotando gráfico de participações percentuais de ['Autonomo', 'Locação de Veículos', 'Manutenção Frota', 'Pneus', 'Diesel Total'] em relação ao CPV
+            # Criando dataframe apenas com Anos e Meses selecionados pelo usuário
 
-    plotar_gráfico_participacoes_percentuais_cpv(
-        st.session_state.df_cpv_filtrado, 
-        row3
-    )
-
-    # Colhendo categorias de CPV escolhidas pelo usuário
-
-    with row4[0]:
-
-        contas_cpv = colher_categorias(
-            st.session_state.df_dre_filtrado, 
-            ['CPV']
-        )
-
-    # Se o usuário selecionar categorias do CPV, plota os gráficos das categorias selecionadas com seus respectivos kpis e metas
-
-    if len(contas_cpv)>0:
-
-        df_grafico = st.session_state.df_cpv_filtrado.copy()
-
-        df_grafico['Mes_Ano'] = df_grafico['Mes_Ano'].dt.strftime('%m/%y')
-
-        for categoria in contas_cpv:
-
-            row4 = st.columns(2)
-
-            with row4[0]:
-
-                st.subheader(categoria)
-
-            i=0
-
-            i = plotar_gráfico_despesa_meta(
-                categoria, 
-                df_grafico, 
-                row4, 
-                i,
-                st.session_state.df_cpv_filtrado
+            st.session_state.df_dre_filtrado = gerar_df_dre_filtrado(
+                filtrar_ano, 
+                filtrar_mes
             )
 
-            i = plotar_graficos_kpi_cpv(
-                categoria, 
-                df_grafico, 
-                row4, 
-                i
+            # Gerando dataframe somente com categorias de CPV em colunas
+
+            df_cpv_filtrado = gerar_df_categorias(
+                st.session_state.df_dre_filtrado, 
+                'CPV'
             )
 
-    st.divider()
+            # Inserir Comissão Geral, Diesel Total e % de ['Autonomo', 'Locação de Veículos', 'Manutenção Frota', 'Pneus', 'Diesel Total'] em relação ao CPV
 
-    st.subheader('Margem Operacional')       
+            st.session_state.df_cpv_filtrado = inserir_kpis_especificos_cpv(df_cpv_filtrado)
 
-    row3 = st.columns(2)
+            # Gerando dataframe somente com categorias de Despesas Operacionais em colunas
 
-    # Plotando gráficos de Resultado Operacional, Margem Operacional e Despesas Operacionais / Paxs
+            df_do_filtrado = gerar_df_categorias(
+                st.session_state.df_dre_filtrado, 
+                'Despesas Operacionais'
+            )
 
-    plotar_graficos_resultado_operacional(
-        row3, 
-        st.session_state.df_grafico_vendas_gerais
-    )
+            st.session_state.df_do_filtrado = inserir_kpis_especificos_do(df_do_filtrado)
 
-    # Colhendo categorias de Despesas Operacionais escolhidas pelo usuário
+            st.session_state.df_df_filtrado = gerar_df_categorias(
+                st.session_state.df_dre_filtrado, 
+                'Despesas Financeiras'
+            )
 
-    row4 = st.columns(2)
+        # Plotando gráfico de participações percentuais de ['Autonomo', 'Locação de Veículos', 'Manutenção Frota', 'Pneus', 'Diesel Total'] em relação ao CPV
 
-    with row4[0]:
-
-        contas_do = colher_categorias(
-            st.session_state.df_dre_filtrado, 
-            ['Despesas Operacionais']
+        plotar_gráfico_participacoes_percentuais_cpv(
+            st.session_state.df_cpv_filtrado, 
+            row3
         )
 
-    # Se o usuário selecionar categorias das Despesas Operacionais, plota os gráficos das categorias selecionadas com seus respectivos kpis e metas
+        # Colhendo categorias de CPV escolhidas pelo usuário
 
-    if len(contas_do)>0:
+        with row4[0]:
 
-        df_grafico = st.session_state.df_do_filtrado.copy()
-
-        df_grafico['Mes_Ano'] = df_grafico['Mes_Ano'].dt.strftime('%m/%y')
-
-        for categoria in contas_do:
-
-            row4 = st.columns(2)
-
-            with row4[0]:
-
-                st.subheader(categoria)
-
-            i=0
-
-            i = plotar_gráfico_despesa_meta(
-                categoria, 
-                df_grafico, 
-                row4, 
-                i,
-                st.session_state.df_do_filtrado
+            contas_cpv = colher_categorias(
+                st.session_state.df_dre_filtrado, 
+                ['CPV']
             )
 
-            i = plotar_graficos_kpi_vendas(
-                categoria, 
-                df_grafico, 
-                row4, 
-                i,
-                st.session_state.df_do_filtrado
+        # Se o usuário selecionar categorias do CPV, plota os gráficos das categorias selecionadas com seus respectivos kpis e metas
+
+        if len(contas_cpv)>0:
+
+            df_grafico = st.session_state.df_cpv_filtrado.copy()
+
+            df_grafico['Mes_Ano'] = df_grafico['Mes_Ano'].dt.strftime('%m/%y')
+
+            for categoria in contas_cpv:
+
+                row4 = st.columns(2)
+
+                with row4[0]:
+
+                    st.subheader(categoria)
+
+                i=0
+
+                i = plotar_gráfico_despesa_meta(
+                    categoria, 
+                    df_grafico, 
+                    row4, 
+                    i,
+                    st.session_state.df_cpv_filtrado
+                )
+
+                i = plotar_graficos_kpi_cpv(
+                    categoria, 
+                    df_grafico, 
+                    row4, 
+                    i
+                )
+
+        st.divider()
+
+        st.subheader('Margem Operacional')       
+
+        row3 = st.columns(2)
+
+        # Plotando gráficos de Resultado Operacional, Margem Operacional e Despesas Operacionais / Paxs
+
+        plotar_graficos_resultado_operacional(
+            row3, 
+            st.session_state.df_grafico_vendas_gerais
+        )
+
+        # Colhendo categorias de Despesas Operacionais escolhidas pelo usuário
+
+        row4 = st.columns(2)
+
+        with row4[0]:
+
+            contas_do = colher_categorias(
+                st.session_state.df_dre_filtrado, 
+                ['Despesas Operacionais']
             )
 
-    st.divider()
+        # Se o usuário selecionar categorias das Despesas Operacionais, plota os gráficos das categorias selecionadas com seus respectivos kpis e metas
 
-    st.subheader('Margem Líquida') 
+        if len(contas_do)>0:
 
-    row3 = st.columns(2)   
+            df_grafico = st.session_state.df_do_filtrado.copy()
 
-    # Plotando gráficos de Resultado Líquido, Margem Líquida e Despesas Financeiras / Paxs
+            df_grafico['Mes_Ano'] = df_grafico['Mes_Ano'].dt.strftime('%m/%y')
 
-    plotar_graficos_resultado_liquido(
-        row3, 
-        st.session_state.df_grafico_vendas_gerais
-    )
+            for categoria in contas_do:
 
-    # Colhendo categorias de Despesas Financeiras escolhidas pelo usuário
+                row4 = st.columns(2)
 
-    row4 = st.columns(2)
+                with row4[0]:
 
-    with row4[0]:
+                    st.subheader(categoria)
 
-        contas_df = colher_categorias(
-            st.session_state.df_dre_filtrado, 
-            ['Investimentos', 'Despesas Investimentos', 'Despesas Gerenciais']
-        )  
+                i=0
 
-    # Se o usuário selecionar categorias das Despesas Financeiras, plota os gráficos das categorias selecionadas com seus respectivos kpis e metas
+                i = plotar_gráfico_despesa_meta(
+                    categoria, 
+                    df_grafico, 
+                    row4, 
+                    i,
+                    st.session_state.df_do_filtrado
+                )
 
-    if len(contas_df)>0:
+                i = plotar_graficos_kpi_vendas(
+                    categoria, 
+                    df_grafico, 
+                    row4, 
+                    i,
+                    st.session_state.df_do_filtrado
+                )
 
-        df_grafico = st.session_state.df_df_filtrado.copy()
+        st.divider()
 
-        df_grafico['Mes_Ano'] = df_grafico['Mes_Ano'].dt.strftime('%m/%y')
+        st.subheader('Margem Líquida') 
 
-        for categoria in contas_df:
+        row3 = st.columns(2)   
 
-            row4 = st.columns(2)
+        # Plotando gráficos de Resultado Líquido, Margem Líquida e Despesas Financeiras / Paxs
 
-            with row4[0]:
+        plotar_graficos_resultado_liquido(
+            row3, 
+            st.session_state.df_grafico_vendas_gerais
+        )
 
-                st.subheader(categoria)
+        # Colhendo categorias de Despesas Financeiras escolhidas pelo usuário
 
-            i=0
+        row4 = st.columns(2)
 
-            i = plotar_gráfico_despesa_meta(
-                categoria, 
-                df_grafico, 
-                row4, 
-                i,
-                st.session_state.df_df_filtrado
-            ) 
+        with row4[0]:
 
-    st.divider()
+            contas_df = colher_categorias(
+                st.session_state.df_dre_filtrado, 
+                ['Investimentos', 'Despesas Investimentos', 'Despesas Gerenciais']
+            )  
 
-    st.subheader('Impostos') 
+        # Se o usuário selecionar categorias das Despesas Financeiras, plota os gráficos das categorias selecionadas com seus respectivos kpis e metas
 
-    # Plotando gráfico de % Impostos 
+        if len(contas_df)>0:
 
-    fig = grafico_1_linha_percentual(st.session_state.df_grafico_vendas_gerais, '% Impostos')
+            df_grafico = st.session_state.df_df_filtrado.copy()
 
-    st.plotly_chart(fig)
+            df_grafico['Mes_Ano'] = df_grafico['Mes_Ano'].dt.strftime('%m/%y')
+
+            for categoria in contas_df:
+
+                row4 = st.columns(2)
+
+                with row4[0]:
+
+                    st.subheader(categoria)
+
+                i=0
+
+                i = plotar_gráfico_despesa_meta(
+                    categoria, 
+                    df_grafico, 
+                    row4, 
+                    i,
+                    st.session_state.df_df_filtrado
+                ) 
+
+        st.divider()
+
+        st.subheader('Impostos') 
+
+        # Plotando gráfico de % Impostos 
+
+        fig = grafico_1_linha_percentual(st.session_state.df_grafico_vendas_gerais, '% Impostos')
+
+        st.plotly_chart(fig)
