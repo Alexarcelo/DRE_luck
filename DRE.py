@@ -562,7 +562,7 @@ def gerar_df_dre_mensal():
 
             for lista in st.session_state.lista_indices_divisao:
 
-                df[lista[0]] = round(df[lista[1]] / df[lista[2]].replace(0, None), 2)
+                df[lista[0]] = round(df[lista[1]] / df[lista[2]].replace(0, None), 4)
             
                 df[lista[0]] = df[lista[0]].fillna(0)
 
@@ -616,7 +616,7 @@ def gerar_df_dre_mensal():
 
         st.session_state.df_dre_atualizado = df_dre_atualizado
 
-        df_dre_mensal = transformar_linhas_em_colunas(df_dre_mensal, 'Tipo', 'Valor_Depto')
+        df_dre_mensal = transformar_linhas_em_colunas(df_dre_atualizado, 'Tipo', 'Valor_Depto')
 
         df_dre_mensal = inserir_coluna_margem_mc(df_dre_mensal, df_dre_atualizado)
 
@@ -1270,7 +1270,7 @@ def grafico_resultado_margem(df, coluna_resultado, coluna_margem, titulo):
 
     else:
 
-        0
+        y_axis_min = 0
 
     if df[coluna_margem].min()<0:
 
@@ -1278,7 +1278,7 @@ def grafico_resultado_margem(df, coluna_resultado, coluna_margem, titulo):
 
     else:
 
-        0
+        y_axis_2_min = 0
 
     fig.update_layout(
         yaxis_title=coluna_resultado,
@@ -1552,14 +1552,16 @@ def inserir_kpis_especificos_do(df):
 
         df['Folha'] = df['13º Salário'] + df['Benefícios'] + df['Encargos Sociais (FGTS, IR, INSS)'] + df['Férias'] + df['Salários'] + df['Vale Alimentação / Refeição'] + df['Vale Transporte']
 
+        df['Folha / Paxs'] = round(df['Folha'] / df['Paxs'], 4)
+
     elif st.session_state.base_luck == 'test_phoenix_salvador':
 
         df['Folha'] = df['DESCONTO FOLHA (MULTAS DE TRÂNSITO/AVARIAS, DEMAIS DESCONTOS)'] + df['ESTAGIARIOS'] + df['FGTS'] + df['FÉRIAS'] + df['INSS'] + df['OUTRAS DESPESAS DE PESSOAL'] \
             + df['PARCELAMENTO INSS'] + df['PREMIAÇÃO'] + df['SALÁRIOS/13° SALÁRIO'] + df['VALE ALIMENTAÇÃO/REFEIÇÃO'] + df['VALE TRANSPORTE']
+        
+        df['Folha / Paxs'] = round(df['Folha'] / df['Total_Paxs'], 4)
 
     df['Folha / Vendas'] = round(df['Folha'] / df['Vendas'], 4)
-
-    df['Folha / Paxs'] = round(df['Folha'] / df['Total_Paxs'], 4)
 
     return df
 
